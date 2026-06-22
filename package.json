@@ -4,7 +4,10 @@
   "description": "Rate-limit-aware gh wrapper with bucket classification, pre-call gating, and audit trail",
   "bounded": {
     "tagline": "Rate-limit-aware gh wrapper with bucket classification, pre-call gating, and audit trail",
-    "kind": "door"
+    "kind": "door",
+    "facet": "verb",
+    "role": "governor",
+    "domain": "github/rate-limit"
   },
   "license": "MIT",
   "type": "module",
