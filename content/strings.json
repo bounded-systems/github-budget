@@ -1,0 +1,10 @@
+{
+  "name": {
+    "type": "name",
+    "value": "Github Budget"
+  },
+  "description": {
+    "type": "meta",
+    "value": "Rate-limit-aware gh wrapper with bucket classification, pre-call gating, and audit trail"
+  }
+}
