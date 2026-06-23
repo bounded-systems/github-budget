@@ -3,8 +3,16 @@
     "type": "name",
     "value": "Github Budget"
   },
+  "tagline": {
+    "type": "tagline",
+    "value": "A rate-limit-aware wrapper around gh: it classifies each call into a budget bucket, gates it before spending, and rec…"
+  },
   "description": {
     "type": "meta",
-    "value": "Rate-limit-aware gh wrapper with bucket classification, pre-call gating, and audit trail"
+    "value": "A rate-limit-aware wrapper around gh: it classifies each call into a budget bucket, gates it before spending, and records an audit trail.  GitHub's API has several distinct rate limits (core, search, GraphQL, …).  This package classifies a call into its bucket, checks the rema…"
+  },
+  "keywords": {
+    "type": "body",
+    "value": "GITHUB · RATE-LIMIT · BUDGET · AUDIT · GATING"
   }
 }
