@@ -39,4 +39,4 @@ export const auditEntrySchema = z.object({
     .nullable()
     .optional()
     .describe("Why a residual gh call is load-bearing (GH-1602); null when incidental."),
-});
+}).describe("One parsed `rate-limit.jsonl` audit row: the gh call, its bucket cost, and GH-1533 attribution.");

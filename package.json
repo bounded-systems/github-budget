@@ -1,6 +1,6 @@
 {
   "name": "@bounded-systems/github-budget",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Rate-limit-aware gh wrapper with bucket classification, pre-call gating, and audit trail",
   "bounded": {
     "tagline": "Rate-limit-aware gh wrapper with bucket classification, pre-call gating, and audit trail",
