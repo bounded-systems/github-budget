@@ -56,9 +56,9 @@
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",
-    "json-schema-to-typescript": "^15.0.4",
     "typescript": "^6.0.3",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "@bounded-systems/schema-gen": "npm:@jsr/bounded-systems__schema-gen@^0.1.0"
   },
   "dependencies": {
     "@bounded-systems/audit-context": "npm:@jsr/bounded-systems__audit-context@^0.2.1",
