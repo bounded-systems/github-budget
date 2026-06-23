@@ -1,6 +1,6 @@
 {
   "name": "@bounded-systems/github-budget",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Rate-limit-aware gh wrapper with bucket classification, pre-call gating, and audit trail",
   "bounded": {
     "tagline": "Rate-limit-aware gh wrapper with bucket classification, pre-call gating, and audit trail",
@@ -61,8 +61,8 @@
     "zod": "^4.4.3"
   },
   "dependencies": {
-    "@bounded-systems/audit-context": "npm:@jsr/bounded-systems__audit-context",
-    "@bounded-systems/env": "npm:@jsr/bounded-systems__env",
-    "@bounded-systems/proc": "npm:@jsr/bounded-systems__proc"
+    "@bounded-systems/audit-context": "npm:@jsr/bounded-systems__audit-context@^0.2.1",
+    "@bounded-systems/env": "npm:@jsr/bounded-systems__env@^0.2.0",
+    "@bounded-systems/proc": "npm:@jsr/bounded-systems__proc@^0.2.3"
   }
 }
