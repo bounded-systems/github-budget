@@ -33,25 +33,38 @@ import { getAuditRuntimeContext, type GhTruthReason } from "@bounded-systems/aud
 import { getEnv } from "@bounded-systems/env";
 import { spawnCapture, type CommandResult } from "@bounded-systems/proc";
 
-const GH_TRUTH_REASONS = [
-  "forward-orphan-detection",
-  "drift-comparator",
-  "stale-comparator",
-] as const;
+import { auditEntrySchema } from "./schemas.ts";
 
+// Re-export the sibling types that surface in this package's public API, so
+// consumers depend on github-budget's contract, not its deps (closes deno doc
+// `private-type-ref`).
+export type { CommandResult } from "@bounded-systems/proc";
+export type { GhTruthReason } from "@bounded-systems/audit-context";
+// The explicit, fast-types public type — generated from the internal schema.
+import type { RateLimitAuditEntry } from "./types.generated.ts";
+export type { RateLimitAuditEntry } from "./types.generated.ts";
+
+/** A GitHub API rate-limit bucket. */
 export type Bucket = "core" | "graphql" | "search";
 
 const COLD_FALLBACK_AVG = 2;
 const ESTIMATE_SAMPLE_SIZE = 50;
 
+/** A point-in-time view of one bucket's budget. */
 export type BudgetSnapshot = {
+  /** The bucket this snapshot is for. */
   bucket: Bucket;
+  /** The bucket's point limit. */
   limit: number;
+  /** Points remaining. */
   remaining: number;
+  /** Bucket reset time, epoch ms. */
   resetAt: number;
+  /** When this snapshot was fetched, epoch ms. */
   fetchedAt: number;
 };
 
+/** Injectable seams for the rate-limit machinery (runner, clock, paths, thresholds, attribution). */
 export type RateLimitDeps = {
   /** Raw runner used to refresh the budget — must NOT be gated. */
   rawRunner?: (cmd: string[]) => CommandResult;
@@ -83,80 +96,56 @@ export type RateLimitDeps = {
 const DEFAULT_THRESHOLD = 100;
 const DEFAULT_SNAPSHOT_TTL_MS = 30_000;
 
-const auditEntrySchema = z.object({
-  ts: z.string(),
-  argv: z.array(z.string()),
-  bucket: z.enum(["core", "graphql", "search"]),
-  remaining_before: z.number().nullable(),
-  remaining_after: z.number().nullable(),
-  exit_code: z.number(),
-  threw: z.enum(["BUDGET_EXHAUSTED", "RUNTIME_ERROR"]).nullable(),
-  cost_delta: z.number().nullable().default(null),
-  // GH-1533 attribution fields. Optional: rows written before GH-1533 (and
-  // any row written by a `recordGhResult` call outside `withBucketGate`) lack
-  // them, but `auditEntrySchema` must still parse those. Production rows
-  // (always via `withBucketGate`) populate all of them.
-  //
-  //   api        — `graphql` (incl. every `--json` call) or `rest` (the
-  //                `core`/`search` pools collapse here); the "was this a
-  //                GraphQL call?" filter `prx doctor gh-budget` uses.
-  //   verb       — prx verb that issued it (`triage.status`, `intake.search`);
-  //                null when the gated runner ran outside `runCli`.
-  //   actor      — process identity (`claude-code`, a test harness, …).
-  //   operation  — GraphQL query/mutation name, REST path, or `<noun>.<verb>`
-  //                for plain `gh` subcommands; null when not derivable.
-  //   cost       — exact GraphQL cost when the response carried a `rateLimit`
-  //                block, else the measured `remaining_before − remaining_after`
-  //                when `PRX_GH_AUDIT_COST=1`, else null. (`cost_delta` above
-  //                is the cache-derived estimate kept for `estimateSweepCost`.)
-  //   remaining / limit / reset_at — bucket budget after the call (from the
-  //                `rateLimit` block, a post-call refresh, or the gate-time
-  //                snapshot); reset_at is ISO-8601.
-  //   duration_ms — wall time spent in the `gh` spawn (0 for a gated-out call).
-  api: z.enum(["graphql", "rest"]).optional(),
-  verb: z.string().nullable().optional(),
-  actor: z.string().optional(),
-  operation: z.string().nullable().optional(),
-  cost: z.number().nullable().optional(),
-  remaining: z.number().nullable().optional(),
-  limit: z.number().nullable().optional(),
-  reset_at: z.string().nullable().optional(),
-  duration_ms: z.number().nonnegative().optional(),
-  // GH-1602: typed reason a residual gh call survived the triage→bd
-  // substitution. `null` (or absent) on every other gh call — that's the
-  // signal "this gh call is incidental, not load-bearing." Present values
-  // identify the load-bearing comparator: forward-orphan / drift / stale.
-  gh_truth_reason: z.enum(GH_TRUTH_REASONS).nullable().optional(),
-});
-export type RateLimitAuditEntry = z.infer<typeof auditEntrySchema>;
+// The audit-row schema lives in ./schemas (internal); the explicit public type
+// is generated from it. `RateLimitAuditEntry` is re-exported below from
+// ./types.generated.ts so no zod type reaches the public API (JSR fast-types).
 
 /**
  * The GH-1533 attribution payload `withBucketGate` (and `gateGhArgv` on a
  * pre-spawn block) hands to `writeAudit` to enrich the `rate-limit.jsonl` row.
  */
 export type GhCallAttribution = {
+  /** `graphql` (incl. `--json`) or `rest`. */
   api: "graphql" | "rest";
+  /** prx verb that issued the call, or null. */
   verb: string | null;
+  /** Process identity. */
   actor: string;
+  /** GraphQL/REST operation name, or null. */
   operation: string | null;
+  /** Measured/exact cost, or null. */
   cost: number | null;
+  /** Points remaining after the call. */
   remaining: number | null;
+  /** Bucket point limit. */
   limit: number | null;
+  /** Bucket reset time, epoch ms, or null. */
   resetAtMs: number | null;
+  /** Wall time in the gh spawn, ms. */
   durationMs: number;
+  /** Why a residual gh call is load-bearing, or null. */
   ghTruthReason: GhTruthReason | null;
 };
 
+/** A running tally of gh calls + costs since {@link beginSweep}. */
 export type SweepCounter = {
+  /** Label for this sweep. */
   scope: string;
+  /** When the sweep began, epoch ms. */
   startedAt: number;
+  /** Per-bucket remaining at sweep start. */
   startSnapshots: Partial<Record<Bucket, number>>;
+  /** Calls counted per bucket. */
   callsByBucket: Record<Bucket, number>;
+  /** Cost accumulated per bucket. */
   costsByBucket: Record<Bucket, number>;
 };
 
+/** A projected cost of a sweep, per bucket, derived from a recent sample. */
 export type SweepCostEstimate = {
+  /** Estimated cost per bucket. */
   perBucket: Record<Bucket, number>;
+  /** The sample the estimate was derived from. */
   sample: { calls: number; avg: number };
 };
 
@@ -164,6 +153,7 @@ const cache = new Map<Bucket, BudgetSnapshot>();
 let configuredDeps: RateLimitDeps = {};
 let currentSweep: SweepCounter | null = null;
 
+/** Install the ambient {@link RateLimitDeps} used by the module-level functions. */
 export function configureRateLimit(deps: RateLimitDeps): void {
   configuredDeps = deps;
 }
@@ -174,11 +164,17 @@ export function __resetRateLimitCacheForTesting(): void {
   currentSweep = null;
 }
 
+/** Thrown when a gh call is refused because its bucket's budget is exhausted. */
 export class BucketBudgetExhaustedError extends Error {
+  /** The exhausted bucket. */
   readonly bucket: Bucket;
+  /** Points remaining (at or below threshold). */
   readonly remaining: number;
+  /** Bucket reset time, epoch ms. */
   readonly resetAt: number;
+  /** The gh argv that was refused. */
   readonly argv: string[];
+  /** Construct from the offending `bucket`, its `snapshot`, and the refused `argv`. */
   constructor(bucket: Bucket, snapshot: BudgetSnapshot, argv: string[]) {
     super(
       `gh ${bucket} budget exhausted: ${snapshot.remaining} remaining (resets at ${new Date(snapshot.resetAt).toISOString()})`,
@@ -191,21 +187,27 @@ export class BucketBudgetExhaustedError extends Error {
   }
 }
 
+/** {@link BucketBudgetExhaustedError} for the GraphQL bucket. */
 export class GraphQLBudgetExhaustedError extends BucketBudgetExhaustedError {
+  /** Construct from the GraphQL bucket `snapshot` and the refused `argv`. */
   constructor(snapshot: BudgetSnapshot, argv: string[]) {
     super("graphql", snapshot, argv);
     this.name = "GraphQLBudgetExhaustedError";
   }
 }
 
+/** {@link BucketBudgetExhaustedError} for the REST (core) bucket. */
 export class RestBudgetExhaustedError extends BucketBudgetExhaustedError {
+  /** Construct from the core bucket `snapshot` and the refused `argv`. */
   constructor(snapshot: BudgetSnapshot, argv: string[]) {
     super("core", snapshot, argv);
     this.name = "RestBudgetExhaustedError";
   }
 }
 
+/** {@link BucketBudgetExhaustedError} for the search bucket. */
 export class SearchBudgetExhaustedError extends BucketBudgetExhaustedError {
+  /** Construct from the search bucket `snapshot` and the refused `argv`. */
   constructor(snapshot: BudgetSnapshot, argv: string[]) {
     super("search", snapshot, argv);
     this.name = "SearchBudgetExhaustedError";
@@ -619,10 +621,15 @@ const rateLimitBlockSchema = z.object({
   resetAt: z.string().nullable().optional(),
 });
 
-type RateLimitBlock = {
+/** A parsed GraphQL `rateLimit` block: cost + remaining/limit + reset time. */
+export type RateLimitBlock = {
+  /** GraphQL cost of the call, or `null` when absent. */
   cost: number | null;
+  /** Points remaining in the bucket after the call. */
   remaining: number | null;
+  /** The bucket's point limit. */
   limit: number | null;
+  /** Bucket reset time, epoch ms. */
   resetAtMs: number | null;
 };
 
