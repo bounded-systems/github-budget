@@ -20,6 +20,7 @@ import {
   readRateLimitAuditRows,
   recordGhResult,
   refreshBudget,
+  preflight,
   withBucketGate,
   isRateLimitProbe,
   type RateLimitDeps,
@@ -1235,5 +1236,135 @@ describe("refreshBudget", () => {
       now: fixedNow(1_000_000),
     };
     expect(refreshBudget(deps)).toBeNull();
+  });
+});
+
+describe("sibling headroom on the exhausted error (github-budget#9)", () => {
+  test("names the OTHER buckets, so a spent bucket does not read as an outage", () => {
+    const audit = makeAuditCapture();
+    const deps: RateLimitDeps = {
+      // The 2026-07-30 shape: graphql spent, core almost untouched.
+      rawRunner: makeRunner({
+        core: { limit: 15000, remaining: 13385, reset: 9999 },
+        graphql: { limit: 5000, remaining: 0, reset: 9999 },
+        search: { limit: 30, remaining: 30, reset: 9999 },
+      }),
+      now: fixedNow(1_000_000),
+      auditPath: () => "/tmp/audit.jsonl",
+      ...audit,
+    };
+
+    let caught: BucketBudgetExhaustedError | null = null;
+    try {
+      gateGhArgv(["gh", "pr", "view", "--json", "number"], deps);
+    } catch (e) {
+      caught = e as BucketBudgetExhaustedError;
+    }
+
+    expect(caught).toBeInstanceOf(GraphQLBudgetExhaustedError);
+    const err = caught!;
+    // The whole point: the reader is told where the headroom IS.
+    expect(err.message).toContain("core 13385/15000");
+    expect(err.message).toContain("isolated");
+    expect(err.siblings.map((s) => s.bucket).sort()).toEqual(["core", "search"]);
+    // ...and never lists the exhausted bucket as its own sibling.
+    expect(err.siblings.some((s) => s.bucket === "graphql")).toBe(false);
+  });
+
+  test("siblings default to empty — a directly-constructed error stays valid", () => {
+    const snap = {
+      bucket: "graphql" as const,
+      limit: 5000,
+      remaining: 0,
+      resetAt: 1234567000,
+      fetchedAt: 1234560000,
+    };
+    const err = new GraphQLBudgetExhaustedError(snap, ["gh", "pr", "view"]);
+    expect(err.siblings).toEqual([]);
+    expect(err.message).toContain("graphql budget exhausted");
+    expect(err.message).not.toContain("Other buckets");
+  });
+});
+
+describe("preflight", () => {
+  test("reports headroom on every bucket and says it is safe to start", () => {
+    const deps: RateLimitDeps = {
+      rawRunner: makeRunner({
+        core: { limit: 15000, remaining: 14000, reset: 9999 },
+        graphql: { limit: 5000, remaining: 4800, reset: 9999 },
+        search: { limit: 30, remaining: 30, reset: 9999 },
+      }),
+      now: fixedNow(1_000_000),
+    };
+    const report = preflight({}, deps)!;
+    expect(report.ok).toBe(true);
+    expect(report.low).toEqual([]);
+    expect(report.snapshots).toHaveLength(3);
+    expect(report.text).toContain("headroom on every bucket");
+    expect(report.text).not.toContain("⚠");
+  });
+
+  test("flags the low bucket by name and says the others are still usable", () => {
+    const deps: RateLimitDeps = {
+      rawRunner: makeRunner({
+        core: { limit: 15000, remaining: 13385, reset: 9999 },
+        graphql: { limit: 5000, remaining: 0, reset: 9999 },
+        search: { limit: 30, remaining: 30, reset: 9999 },
+      }),
+      now: fixedNow(1_000_000),
+    };
+    const report = preflight({}, deps)!;
+    expect(report.ok).toBe(false);
+    expect(report.low.map((s) => s.bucket)).toEqual(["graphql"]);
+    expect(report.text).toContain("graphql LOW");
+    expect(report.text).toContain("⚠ low");
+    // The routing fact, not an outage.
+    expect(report.text).toContain("isolated");
+  });
+
+  test("a full search bucket is never 'low' — the flat gate threshold would say it is", () => {
+    // search's limit is 30 against core's 15000. The gate's flat 100-point
+    // threshold marks an UNTOUCHED search bucket as low on every call, which
+    // would make this check pure noise. Proportional is the only default that
+    // means the same thing in all three buckets.
+    const deps: RateLimitDeps = {
+      rawRunner: makeRunner({
+        core: { limit: 15000, remaining: 14000, reset: 9999 },
+        graphql: { limit: 5000, remaining: 4800, reset: 9999 },
+        search: { limit: 30, remaining: 30, reset: 9999 },
+      }),
+      now: fixedNow(1_000_000),
+    };
+    const report = preflight({}, deps)!;
+    expect(report.low).toEqual([]);
+    expect(report.ok).toBe(true);
+  });
+
+  test("`needed` asks the sharper question: enough for the sweep I am about to run", () => {
+    const deps: RateLimitDeps = {
+      rawRunner: makeRunner({
+        core: { limit: 15000, remaining: 14000, reset: 9999 },
+        graphql: { limit: 5000, remaining: 1200, reset: 9999 },
+        search: { limit: 30, remaining: 30, reset: 9999 },
+      }),
+      now: fixedNow(1_000_000),
+    };
+    // 1200/5000 is 24% — healthy by the proportional default...
+    expect(preflight({}, deps)!.ok).toBe(true);
+    // ...but not enough for a sweep that will spend 2000 GraphQL points.
+    const strict = preflight({ needed: { graphql: 2000 } }, deps)!;
+    expect(strict.ok).toBe(false);
+    expect(strict.low.map((s) => s.bucket)).toEqual(["graphql"]);
+    // A per-bucket requirement must not drag unrelated buckets in with it.
+    expect(strict.low.some((s) => s.bucket === "search")).toBe(false);
+  });
+
+  test("an unfetchable budget is null, not a healthy report", () => {
+    const deps: RateLimitDeps = {
+      rawRunner: () => ({ stdout: "", stderr: "boom", status: 1 }),
+      now: fixedNow(1_000_000),
+    };
+    // Reporting "ok" here would be the exact failure this package exists to stop.
+    expect(preflight({}, deps)).toBeNull();
   });
 });

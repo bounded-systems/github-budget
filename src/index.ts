@@ -174,24 +174,48 @@ export class BucketBudgetExhaustedError extends Error {
   readonly resetAt: number;
   /** The gh argv that was refused. */
   readonly argv: string[];
-  /** Construct from the offending `bucket`, its `snapshot`, and the refused `argv`. */
-  constructor(bucket: Bucket, snapshot: BudgetSnapshot, argv: string[]) {
+  /**
+   * The OTHER buckets' headroom at refusal time, when known.
+   *
+   * GitHub isolates `core` / `graphql` / `search`, so one bucket at zero says
+   * nothing about the others — and an error naming only the exhausted one reads
+   * as "GitHub is unavailable to me" when the truth is "one bucket is spent,
+   * route around it". Both 2026-07-30 incidents were diagnosed by hand for
+   * exactly this reason: on each, `graphql` sat at 0 while `core` was above
+   * 13,000 (see github-budget#9).
+   */
+  readonly siblings: readonly BudgetSnapshot[];
+  /** Construct from the offending `bucket`, its `snapshot`, the refused `argv`, and (optionally) the other buckets' snapshots. */
+  constructor(
+    bucket: Bucket,
+    snapshot: BudgetSnapshot,
+    argv: string[],
+    siblings: readonly BudgetSnapshot[] = [],
+  ) {
+    const others = siblings.filter((s) => s.bucket !== bucket);
+    const otherText =
+      others.length > 0
+        ? `. Other buckets are isolated and unaffected: ${others
+            .map((s) => `${s.bucket} ${s.remaining}/${s.limit}`)
+            .join(", ")}`
+        : "";
     super(
-      `gh ${bucket} budget exhausted: ${snapshot.remaining} remaining (resets at ${new Date(snapshot.resetAt).toISOString()})`,
+      `gh ${bucket} budget exhausted: ${snapshot.remaining} remaining (resets at ${new Date(snapshot.resetAt).toISOString()})${otherText}`,
     );
     this.name = "BucketBudgetExhaustedError";
     this.bucket = bucket;
     this.remaining = snapshot.remaining;
     this.resetAt = snapshot.resetAt;
     this.argv = argv;
+    this.siblings = others;
   }
 }
 
 /** {@link BucketBudgetExhaustedError} for the GraphQL bucket. */
 export class GraphQLBudgetExhaustedError extends BucketBudgetExhaustedError {
   /** Construct from the GraphQL bucket `snapshot` and the refused `argv`. */
-  constructor(snapshot: BudgetSnapshot, argv: string[]) {
-    super("graphql", snapshot, argv);
+  constructor(snapshot: BudgetSnapshot, argv: string[], siblings: readonly BudgetSnapshot[] = []) {
+    super("graphql", snapshot, argv, siblings);
     this.name = "GraphQLBudgetExhaustedError";
   }
 }
@@ -199,8 +223,8 @@ export class GraphQLBudgetExhaustedError extends BucketBudgetExhaustedError {
 /** {@link BucketBudgetExhaustedError} for the REST (core) bucket. */
 export class RestBudgetExhaustedError extends BucketBudgetExhaustedError {
   /** Construct from the core bucket `snapshot` and the refused `argv`. */
-  constructor(snapshot: BudgetSnapshot, argv: string[]) {
-    super("core", snapshot, argv);
+  constructor(snapshot: BudgetSnapshot, argv: string[], siblings: readonly BudgetSnapshot[] = []) {
+    super("core", snapshot, argv, siblings);
     this.name = "RestBudgetExhaustedError";
   }
 }
@@ -208,8 +232,8 @@ export class RestBudgetExhaustedError extends BucketBudgetExhaustedError {
 /** {@link BucketBudgetExhaustedError} for the search bucket. */
 export class SearchBudgetExhaustedError extends BucketBudgetExhaustedError {
   /** Construct from the search bucket `snapshot` and the refused `argv`. */
-  constructor(snapshot: BudgetSnapshot, argv: string[]) {
-    super("search", snapshot, argv);
+  constructor(snapshot: BudgetSnapshot, argv: string[], siblings: readonly BudgetSnapshot[] = []) {
+    super("search", snapshot, argv, siblings);
     this.name = "SearchBudgetExhaustedError";
   }
 }
@@ -421,9 +445,14 @@ function buildExhaustedError(
   argv: readonly string[],
 ): BucketBudgetExhaustedError {
   const argvCopy = [...argv];
-  if (bucket === "graphql") return new GraphQLBudgetExhaustedError(snapshot, argvCopy);
-  if (bucket === "search") return new SearchBudgetExhaustedError(snapshot, argvCopy);
-  return new RestBudgetExhaustedError(snapshot, argvCopy);
+  // Read the OTHER buckets straight off the cache — they were populated by the
+  // same single `rate_limit` refresh that produced `snapshot`, so this costs
+  // nothing and cannot itself be gated. Missing entries simply mean a smaller
+  // (still honest) message rather than a second call.
+  const siblings = [...cache.values()].filter((s) => s.bucket !== bucket);
+  if (bucket === "graphql") return new GraphQLBudgetExhaustedError(snapshot, argvCopy, siblings);
+  if (bucket === "search") return new SearchBudgetExhaustedError(snapshot, argvCopy, siblings);
+  return new RestBudgetExhaustedError(snapshot, argvCopy, siblings);
 }
 
 /**
@@ -954,6 +983,91 @@ export function formatBudgetResetTime(resetAt: number): string {
   const mm = String(date.getUTCMinutes()).padStart(2, "0");
   const ss = String(date.getUTCSeconds()).padStart(2, "0");
   return `${hh}:${mm}:${ss} UTC`;
+}
+
+/** The result of a {@link preflight} check. */
+export type PreflightReport = {
+  /** Every bucket's headroom, freshly fetched. */
+  snapshots: BudgetSnapshot[];
+  /** Buckets judged low — by `needed` where given, else by `lowFraction`. Empty when everything has room. */
+  low: BudgetSnapshot[];
+  /** True when no bucket is low — i.e. it is safe to start. */
+  ok: boolean;
+  /** One-line-per-bucket summary, suitable for printing at session start. */
+  text: string;
+};
+
+/**
+ * Session pre-flight: report per-bucket headroom BEFORE doing expensive work.
+ *
+ * The gap this closes (github-budget#9): two independent sessions share one
+ * account's buckets and cannot see each other's spend. On 2026-07-30 a second
+ * session drained GraphQL with no way to know the first had already spent it,
+ * then the same failure recurred within the hour. A cheap check at session
+ * start — and before any sweep — turns "discover the limit by hitting it" into
+ * "see it coming".
+ *
+ * Deliberately NOT a gate, and it must not be read as one. Buckets are shared
+ * and this is a snapshot, not a reservation: another session can spend the
+ * headroom between this call and yours. It narrows the window; it cannot close
+ * it. Closing it needs custody at a single egress point (`prx#1034`).
+ *
+ * Cost: one `rate_limit` call, which GitHub exempts from rate limiting — so
+ * this is free to call as often as is useful.
+ *
+ * NOTE ON REACH: like the rest of this package, the default probe shells out to
+ * `gh` (see {@link refreshBudget}). An environment without `gh` — a cloud agent
+ * session, for instance, which is exactly where both incidents happened — must
+ * inject `rawRunner` via {@link RateLimitDeps} to point at its own transport.
+ * That is the same coverage boundary documented in the README; the pre-flight
+ * does not escape it.
+ *
+ * Returns null when the budget could not be fetched, matching
+ * {@link refreshBudget}'s convention — an unknown budget is reported as unknown
+ * rather than as healthy.
+ */
+export function preflight(
+  opts: { lowFraction?: number; needed?: Partial<Record<Bucket, number>> } = {},
+  deps: RateLimitDeps = configuredDeps,
+): PreflightReport | null {
+  const snapshots = refreshBudget(deps);
+  if (!snapshots) return null;
+  // Proportional by default, NOT the gate's flat point threshold. The buckets
+  // have wildly different sizes — `search` has a limit of 30 against `core`'s
+  // 15,000 — so a flat 100-point floor marks a completely untouched `search`
+  // bucket as low on every single call. A fraction is the only default that
+  // means the same thing in all three.
+  const lowFraction = opts.lowFraction ?? 0.1;
+  const isLow = (s: BudgetSnapshot): boolean => {
+    // An explicit per-bucket requirement wins: a caller who knows it is about
+    // to spend N points in a bucket is asking a sharper question than "is this
+    // bucket healthy". Pairs directly with `estimateSweepCost().perBucket`.
+    const need = opts.needed?.[s.bucket];
+    if (need !== undefined) return s.remaining < need;
+    return s.remaining < s.limit * lowFraction;
+  };
+  const low = snapshots.filter(isLow);
+  const lines = snapshots.map((s) => {
+    const label = `${s.bucket}:`.padEnd(9, " ");
+    const flag = isLow(s) ? "  ⚠ low" : "";
+    return `  ${label} ${s.remaining}/${s.limit} (resets ${formatBudgetResetTime(s.resetAt)})${flag}`;
+  });
+  const header =
+    low.length === 0
+      ? "GitHub budget — headroom on every bucket:"
+      : `GitHub budget — ${low.map((s) => s.bucket).join(", ")} LOW:`;
+  // Buckets are isolated, so a low bucket is a routing fact, not an outage.
+  // Saying so here is what stops the next reader diagnosing "GitHub is down".
+  const footer =
+    low.length === 0
+      ? []
+      : ["  (buckets are isolated — the others above are unaffected and still usable)"];
+  return {
+    snapshots,
+    low,
+    ok: low.length === 0,
+    text: [header, ...lines, ...footer].join("\n"),
+  };
 }
 
 /**
